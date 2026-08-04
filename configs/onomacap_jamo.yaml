@@ -1,0 +1,53 @@
+exp_name: "onomacap_htsat_bart_jamo_bf16"
+device: "cuda"
+pretrain: false
+seed: 20
+
+audio_args:
+  sr: 32000
+  n_fft: 1024
+  hop_length: 320
+  f_min: 50
+  f_max: 14000
+  n_mels: 64
+  max_length: 0
+  mono: true
+
+data_args:
+  dataset: "OnomaCap"
+  batch_size: 16
+  num_workers: 4
+
+audio_encoder_args:
+  model_arch: "transformer"
+  model_name: "htsat"
+  pretrained: true
+  freeze: false
+  spec_augment: true
+
+text_decoder_args:
+  name: "facebook/bart-base"
+  pretrained: false
+  max_length: 80
+
+optim_args:
+  scheduler: "cosine"
+  lr: !!float 3e-5
+  optimizer_name: "adamw"
+  betas: [0.9, 0.999]
+  eps: !!float 1e-8
+  momentum: 0.9
+  gamma: 0.1
+  warmup_epochs: 1
+  step_epochs: 10
+  weight_decay: !!float 1e-6
+
+training:
+  epochs: 20
+  clip_grad: 2
+  dropout: 0.2
+  precision: "bf16"
+  checkpoint_root: "/content/drive/MyDrive/OnomaCap/checkpoints"
+
+results:
+  root: "/content/drive/MyDrive/OnomaCap/results"
