@@ -361,9 +361,15 @@ def main():
         "offsets": offsets,
         "lengths": lengths,
         "summaries": np.stack(summaries).astype(np.float32),
-        "audio_files": annotations["audio_file"].astype(str).to_numpy(),
-        "factor_names": np.asarray(FACTOR_NAMES),
-        "summary_names": np.asarray(SUMMARY_NAMES),
+
+        "audio_files": np.asarray(
+            annotations["audio_file"].astype(str).tolist(),
+            dtype=np.str_,
+        ),
+
+        "factor_names": np.asarray(FACTOR_NAMES, dtype=np.str_),
+        "summary_names": np.asarray(SUMMARY_NAMES, dtype=np.str_),
+
         "sample_rate": np.asarray(args.sr, dtype=np.int32),
         "window_ms": np.asarray(args.window_ms, dtype=np.int32),
         "hop_ms": np.asarray(args.hop_ms, dtype=np.int32),
