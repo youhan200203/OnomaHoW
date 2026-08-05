@@ -3,9 +3,12 @@
 
 """HTSAT-BART captioning model with canonical-Jamo targets."""
 
+import math
+
 import torch
 import torch.nn as nn
 from transformers import BartConfig, BartForConditionalGeneration, BartTokenizer
+from transformers.modeling_outputs import BaseModelOutput
 
 from models.audio_encoder import AudioEncoderModel
 from models.audio_encoder_config import AudioEncoderConfig
@@ -62,6 +65,34 @@ class BartCaptionModel(nn.Module):
             encoder_config.hidden_size,
             self.decoder.config.hidden_size,
         )
+        factor_config = config.get("factor_args", {})
+        self.factor_enabled = bool(factor_config.get("enabled", False))
+        self.factor_names = tuple(factor_config.get("names", ()))
+        if self.factor_enabled:
+            if not self.factor_names:
+                raise ValueError("factor_args.names must not be empty.")
+            hidden_size = self.decoder.config.hidden_size
+            self.factor_value_projection = nn.Linear(1, hidden_size)
+            self.factor_embedding = nn.Embedding(
+                len(self.factor_names),
+                hidden_size,
+            )
+            self.factor_layer_norm = nn.LayerNorm(hidden_size)
+            self.factor_dropout = nn.Dropout(
+                float(factor_config.get("dropout", 0.1))
+            )
+            init_std = float(self.decoder.config.init_std)
+            nn.init.normal_(
+                self.factor_value_projection.weight,
+                mean=0.0,
+                std=init_std,
+            )
+            nn.init.zeros_(self.factor_value_projection.bias)
+            nn.init.normal_(
+                self.factor_embedding.weight,
+                mean=0.0,
+                std=init_std,
+            )
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
 
     @property
@@ -80,6 +111,104 @@ class BartCaptionModel(nn.Module):
     def forward_encoder(self, audios):
         outputs = self.encoder(audios)
         return self.enc_to_dec_proj(outputs.last_hidden_state)
+
+    def _sinusoidal_time_encoding(self, length, hidden_size, device, dtype):
+        position = torch.arange(length, device=device, dtype=torch.float32)
+        frequency = torch.exp(
+            torch.arange(0, hidden_size, 2, device=device, dtype=torch.float32)
+            * (-math.log(10_000.0) / hidden_size)
+        )
+        encoding = torch.zeros(
+            length,
+            hidden_size,
+            device=device,
+            dtype=torch.float32,
+        )
+        encoding[:, 0::2] = torch.sin(position[:, None] * frequency[None, :])
+        encoding[:, 1::2] = torch.cos(position[:, None] * frequency[None, :])
+        return encoding.to(dtype=dtype)
+
+    def _encode_factor_tokens(self, factors, factor_mask):
+        if not self.factor_enabled:
+            raise RuntimeError("Acoustic factor conditioning is disabled.")
+        if factors is None or factor_mask is None:
+            raise ValueError("factors and factor_mask are required.")
+        if factors.ndim != 3:
+            raise ValueError(f"Expected factors [B, F, T], got {factors.shape}.")
+        batch_size, factor_count, time_length = factors.shape
+        if factor_count != len(self.factor_names):
+            raise ValueError(
+                f"Expected {len(self.factor_names)} factors, got {factor_count}."
+            )
+        if factor_mask.shape != (batch_size, time_length):
+            raise ValueError(
+                f"Expected factor_mask {(batch_size, time_length)}, "
+                f"got {factor_mask.shape}."
+            )
+
+        values = factors.transpose(1, 2).unsqueeze(-1)
+        value_embedding = self.factor_value_projection(values)
+        factor_ids = torch.arange(factor_count, device=factors.device)
+        factor_embedding = self.factor_embedding(factor_ids)[None, None, :, :]
+        time_embedding = self._sinusoidal_time_encoding(
+            time_length,
+            value_embedding.size(-1),
+            factors.device,
+            value_embedding.dtype,
+        )[None, :, None, :]
+        tokens = self.factor_layer_norm(
+            value_embedding + factor_embedding + time_embedding
+        )
+        tokens = self.factor_dropout(tokens)
+        flat_tokens = tokens.reshape(batch_size, time_length * factor_count, -1)
+        flat_mask = (
+            factor_mask.bool()
+            .unsqueeze(-1)
+            .expand(batch_size, time_length, factor_count)
+            .reshape(batch_size, time_length * factor_count)
+        )
+        return flat_tokens, flat_mask
+
+    def encode_memory(self, audios, factors=None, factor_mask=None):
+        audio_embeds = self.forward_encoder(audios)
+        audio_memory = self.decoder.model.encoder(
+            input_ids=None,
+            attention_mask=None,
+            head_mask=None,
+            inputs_embeds=audio_embeds,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=True,
+        )["last_hidden_state"]
+        batch_size, audio_token_count, _ = audio_memory.shape
+        audio_mask = torch.ones(
+            batch_size,
+            audio_token_count,
+            dtype=torch.bool,
+            device=audio_memory.device,
+        )
+
+        if self.factor_enabled:
+            factor_tokens, flat_factor_mask = self._encode_factor_tokens(
+                factors,
+                factor_mask,
+            )
+            memory = torch.cat([audio_memory, factor_tokens], dim=1)
+            memory_mask = torch.cat([audio_mask, flat_factor_mask], dim=1)
+            factor_time_length = factors.shape[-1]
+        else:
+            memory = audio_memory
+            memory_mask = audio_mask
+            factor_time_length = 0
+
+        return (
+            BaseModelOutput(last_hidden_state=memory),
+            memory_mask,
+            {
+                "audio_token_count": audio_token_count,
+                "factor_time_length": factor_time_length,
+            },
+        )
 
     def encode_jamo_batch(self, captions):
         encoded = []
@@ -120,13 +249,7 @@ class BartCaptionModel(nn.Module):
             attention_mask[index, :length] = 1
         return input_ids, attention_mask
 
-    def forward_decoder(self, text, encoder_outputs):
-        encoder_outputs = self.decoder.model.encoder(
-            input_ids=None,
-            inputs_embeds=encoder_outputs,
-            return_dict=True,
-        )["last_hidden_state"]
-
+    def _prepare_decoder_batch(self, text):
         input_ids, attention_mask = self.encode_jamo_batch(text)
         decoder_targets = input_ids.masked_fill(
             input_ids == self.tokenizer.pad_token_id,
@@ -137,15 +260,21 @@ class BartCaptionModel(nn.Module):
             self.decoder.config.pad_token_id,
             self.decoder.config.decoder_start_token_id,
         )
+        return input_ids, attention_mask, decoder_targets, decoder_input_ids
+
+    def forward_decoder(self, text, encoder_outputs, encoder_attention_mask):
+        _, attention_mask, decoder_targets, decoder_input_ids = (
+            self._prepare_decoder_batch(text)
+        )
 
         decoder_outputs = self.decoder(
             input_ids=None,
-            attention_mask=None,
+            attention_mask=encoder_attention_mask,
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=attention_mask,
             inputs_embeds=None,
             labels=None,
-            encoder_outputs=(encoder_outputs,),
+            encoder_outputs=encoder_outputs,
             return_dict=True,
         )
         lm_logits = decoder_outputs["logits"]
@@ -154,8 +283,78 @@ class BartCaptionModel(nn.Module):
             decoder_targets.reshape(-1),
         )
 
-    def forward(self, audio, text):
-        return self.forward_decoder(text, self.forward_encoder(audio))
+    def forward(self, audio, text, factors=None, factor_mask=None):
+        encoder_outputs, encoder_attention_mask, _ = self.encode_memory(
+            audio,
+            factors,
+            factor_mask,
+        )
+        return self.forward_decoder(
+            text,
+            encoder_outputs,
+            encoder_attention_mask,
+        )
+
+    @torch.no_grad()
+    def teacher_forced_factor_attention(
+        self,
+        samples,
+        text,
+        factors,
+        factor_mask,
+        layer_index=-1,
+    ):
+        if not self.factor_enabled:
+            raise RuntimeError("Acoustic factor conditioning is disabled.")
+        encoder_outputs, encoder_attention_mask, metadata = self.encode_memory(
+            samples,
+            factors,
+            factor_mask,
+        )
+        input_ids, attention_mask, _, decoder_input_ids = (
+            self._prepare_decoder_batch(text)
+        )
+        outputs = self.decoder(
+            input_ids=None,
+            attention_mask=encoder_attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=attention_mask,
+            encoder_outputs=encoder_outputs,
+            output_attentions=True,
+            return_dict=True,
+        )
+        if outputs.cross_attentions is None:
+            raise RuntimeError("BART did not return decoder cross-attention weights.")
+        cross_attention = outputs.cross_attentions[layer_index].mean(dim=1)
+        audio_token_count = metadata["audio_token_count"]
+        time_length = metadata["factor_time_length"]
+        factor_count = len(self.factor_names)
+        factor_source_attention = cross_attention[:, :, audio_token_count:]
+        expected_factor_tokens = time_length * factor_count
+        if factor_source_attention.size(-1) != expected_factor_tokens:
+            raise RuntimeError(
+                "Factor attention/source layout mismatch: "
+                f"{factor_source_attention.size(-1)} != {expected_factor_tokens}."
+            )
+        factor_attention = factor_source_attention.reshape(
+            cross_attention.size(0),
+            cross_attention.size(1),
+            time_length,
+            factor_count,
+        )
+        factor_attention_mass = factor_attention.sum(dim=2)
+        total_factor_attention = factor_attention_mass.sum(dim=-1)
+        target_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        for token_id in self.id_to_jamo:
+            target_mask |= input_ids == token_id
+        target_mask &= attention_mask.bool()
+        return {
+            "target_ids": input_ids,
+            "target_mask": target_mask,
+            "factor_attention_mass": factor_attention_mass,
+            "total_factor_attention": total_factor_attention,
+            "layer_index": layer_index,
+        }
 
     def _allowed_next_tokens(self, _batch_id, input_ids):
         decoder_start_id = self.decoder.config.decoder_start_token_id
@@ -234,6 +433,8 @@ class BartCaptionModel(nn.Module):
     def generate(
         self,
         samples,
+        factors=None,
+        factor_mask=None,
         use_nucleus_sampling=False,
         num_beams=3,
         max_length=None,
@@ -245,15 +446,10 @@ class BartCaptionModel(nn.Module):
             max_length = self.max_text_length
         self._active_generation_max_length = max_length
 
-        audio_embeds = self.forward_encoder(samples)
-        encoder_outputs = self.decoder.model.encoder(
-            input_ids=None,
-            attention_mask=None,
-            head_mask=None,
-            inputs_embeds=audio_embeds,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=True,
+        encoder_outputs, encoder_attention_mask, _ = self.encode_memory(
+            samples,
+            factors,
+            factor_mask,
         )
         decoder_input_ids = torch.full(
             (encoder_outputs["last_hidden_state"].size(0), 1),
@@ -265,7 +461,7 @@ class BartCaptionModel(nn.Module):
 
         generation_args = dict(
             input_ids=None,
-            attention_mask=None,
+            attention_mask=encoder_attention_mask,
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
             encoder_outputs=encoder_outputs,

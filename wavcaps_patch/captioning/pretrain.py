@@ -13,6 +13,25 @@ from tools.jamo_preprocessing import jamo_to_hangul_caption
 from tools.utils import AverageMeter, decode_output
 
 
+def _unpack_batch(batch_data, device):
+    if len(batch_data) == 6:
+        audio, text, audio_names, audio_ids, factors, factor_mask = batch_data
+        factors = factors.to(device, non_blocking=True)
+        factor_mask = factor_mask.to(device, non_blocking=True)
+    else:
+        audio, text, audio_names, audio_ids = batch_data
+        factors = None
+        factor_mask = None
+    return (
+        audio.to(device, non_blocking=True),
+        text,
+        audio_names,
+        audio_ids,
+        factors,
+        factor_mask,
+    )
+
+
 def train(model, dataloader, optimizer, scheduler, device, epoch, clip_grad=0):
     model.train()
     epoch_loss = AverageMeter()
@@ -21,10 +40,7 @@ def train(model, dataloader, optimizer, scheduler, device, epoch, clip_grad=0):
     if device == "cuda" and not torch.cuda.is_bf16_supported():
         raise RuntimeError("The selected CUDA device does not support BF16.")
 
-    for batch_id, (audio, text, _audio_names, _) in tqdm(
-        enumerate(dataloader),
-        total=len(dataloader),
-    ):
+    for batch_id, batch_data in tqdm(enumerate(dataloader), total=len(dataloader)):
         optimizer.zero_grad(set_to_none=True)
         step = len(dataloader) * (epoch - 1) + batch_id
         if scheduler is not None:
@@ -36,9 +52,12 @@ def train(model, dataloader, optimizer, scheduler, device, epoch, clip_grad=0):
             }
         )
 
-        audio = audio.to(device, non_blocking=True)
+        audio, text, _audio_names, _, factors, factor_mask = _unpack_batch(
+            batch_data,
+            device,
+        )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            loss = model(audio, text)
+            loss = model(audio, text, factors=factors, factor_mask=factor_mask)
 
         if not torch.isfinite(loss):
             raise FloatingPointError(
@@ -80,10 +99,16 @@ def validate(data_loader, model, device, log_dir, epoch, beam_size):
     start_time = time.time()
 
     for batch_data in tqdm(data_loader, total=len(data_loader)):
-        audios, caption_lists, audio_names, _audio_ids = batch_data
-        audios = audios.to(device)
+        audios, caption_lists, audio_names, _audio_ids, factors, factor_mask = (
+            _unpack_batch(batch_data, device)
+        )
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            output = model.generate(samples=audios, num_beams=beam_size)
+            output = model.generate(
+                samples=audios,
+                factors=factors,
+                factor_mask=factor_mask,
+                num_beams=beam_size,
+            )
 
         predicted_captions.extend(output)
         reference_captions.extend(

@@ -94,7 +94,27 @@ def main():
 
     if config["pretrain"]:
         pretrain_checkpoint = load_checkpoint(config["pretrain_path"], device)
-        model.load_state_dict(pretrain_checkpoint["model"])
+        strict = bool(config.get("pretrain_strict", True))
+        incompatible = model.load_state_dict(
+            pretrain_checkpoint["model"],
+            strict=strict,
+        )
+        if not strict:
+            unexpected = list(incompatible.unexpected_keys)
+            invalid_missing = [
+                key
+                for key in incompatible.missing_keys
+                if not key.startswith("factor_")
+            ]
+            if unexpected or invalid_missing:
+                raise RuntimeError(
+                    "Unexpected warm-start mismatch: "
+                    f"missing={incompatible.missing_keys}, "
+                    f"unexpected={unexpected}"
+                )
+            main_logger.info(
+                f"New factor parameters: {list(incompatible.missing_keys)}"
+            )
         main_logger.info(f"Loaded weights from {config['pretrain_path']}")
 
     optimizer = get_optimizer(
@@ -138,6 +158,9 @@ def main():
     epoch_checkpoint_dir = checkpoint_dir / "epochs"
     epoch_checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_model_path = checkpoint_dir / "best_model.pt"
+    evaluation_beam_size = int(
+        config.get("evaluation", {}).get("beam_size", 3)
+    )
 
     start_epoch = 1
     loss_stats = []
@@ -214,7 +237,7 @@ def main():
             device=device,
             log_dir=log_output_dir,
             epoch=epoch,
-            beam_size=3,
+            beam_size=evaluation_beam_size,
         )
         selection_score = float(metrics["bleu_1"]["score"])
         selection_scores.append(selection_score)
@@ -232,7 +255,7 @@ def main():
                 {
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
-                    "beam_size": 3,
+                    "beam_size": evaluation_beam_size,
                     "epoch": epoch,
                     "selection_metric": "bleu_1",
                     "selection_score": selection_score,
@@ -272,7 +295,7 @@ def main():
         device=device,
         log_dir=log_output_dir,
         epoch=0,
-        beam_size=3,
+        beam_size=evaluation_beam_size,
     )
     wandb.log(
         {f"test/{name}": float(values["score"]) for name, values in test_metrics.items()}
