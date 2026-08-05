@@ -164,9 +164,11 @@ def main():
         if "numpy_rng_state" in checkpoint:
             np.random.set_state(checkpoint["numpy_rng_state"])
         if "torch_rng_state" in checkpoint:
-            torch.set_rng_state(checkpoint["torch_rng_state"])
+            torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
         if checkpoint.get("cuda_rng_state") is not None:
-            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+            torch.cuda.set_rng_state_all(
+                [state.cpu() for state in checkpoint["cuda_rng_state"]]
+            )
         main_logger.info(f"Resume: {resume_path} (next epoch: {start_epoch})")
     else:
         main_logger.info("No epoch checkpoint found; start at epoch 1.")
