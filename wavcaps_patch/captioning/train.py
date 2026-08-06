@@ -100,11 +100,18 @@ def main():
             strict=strict,
         )
         if not strict:
+            if any(
+                ".factor_attn." in key
+                for key in incompatible.missing_keys
+            ):
+                model.initialize_factor_attention_from_audio()
             unexpected = list(incompatible.unexpected_keys)
             invalid_missing = [
                 key
                 for key in incompatible.missing_keys
                 if not key.startswith("factor_")
+                and ".factor_attn." not in key
+                and ".factor_attn_layer_norm." not in key
             ]
             if unexpected or invalid_missing:
                 raise RuntimeError(

@@ -1,4 +1,4 @@
-exp_name: "onomacap_htsat_bart_jamo_factor_bf16"
+exp_name: "onomacap_htsat_bart_jamo_factor_dual_cross_attn_bf16"
 device: "cuda"
 pretrain: true
 pretrain_strict: false
@@ -39,6 +39,7 @@ factor_args:
   window_ms: 200
   hop_ms: 100
   dropout: 0.1
+  audio_modality_dropout: 0.2
 
 optim_args:
   scheduler: "cosine"

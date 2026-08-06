@@ -3,12 +3,14 @@
 
 """HTSAT-BART captioning model with canonical-Jamo targets."""
 
+import copy
 import math
 
 import torch
 import torch.nn as nn
 from transformers import BartConfig, BartForConditionalGeneration, BartTokenizer
 from transformers.modeling_outputs import BaseModelOutput
+from transformers.models.bart.modeling_bart import BartDecoderLayer
 
 from models.audio_encoder import AudioEncoderModel
 from models.audio_encoder_config import AudioEncoderConfig
@@ -19,6 +21,82 @@ from tools.jamo_preprocessing import (
     JUNGSEONG,
     jamo_to_hangul_caption,
 )
+
+
+class DualCrossAttentionBartDecoderLayer(BartDecoderLayer):
+    def __init__(self, config):
+        super().__init__(config)
+        self.factor_attn = copy.deepcopy(self.encoder_attn)
+        self.factor_attn_layer_norm = nn.LayerNorm(self.embed_dim)
+        self.audio_token_count = None
+        self.last_factor_attention = None
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        layer_head_mask=None,
+        cross_attn_layer_head_mask=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=True,
+    ):
+        if encoder_hidden_states is None or self.audio_token_count is None:
+            return super().forward(
+                hidden_states,
+                attention_mask=attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                layer_head_mask=layer_head_mask,
+                cross_attn_layer_head_mask=cross_attn_layer_head_mask,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+
+        audio_memory = encoder_hidden_states[:, :self.audio_token_count]
+        factor_memory = encoder_hidden_states[:, self.audio_token_count:]
+        audio_mask = (
+            encoder_attention_mask[..., :self.audio_token_count]
+            if encoder_attention_mask is not None
+            else None
+        )
+        factor_mask = (
+            encoder_attention_mask[..., self.audio_token_count:]
+            if encoder_attention_mask is not None
+            else None
+        )
+        outputs = super().forward(
+            hidden_states,
+            attention_mask=attention_mask,
+            encoder_hidden_states=audio_memory,
+            encoder_attention_mask=audio_mask,
+            layer_head_mask=layer_head_mask,
+            cross_attn_layer_head_mask=cross_attn_layer_head_mask,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+
+        hidden_states = outputs[0]
+        residual = hidden_states
+        factor_context, factor_attention, _ = self.factor_attn(
+            hidden_states=hidden_states,
+            key_value_states=factor_memory,
+            attention_mask=factor_mask,
+            layer_head_mask=None,
+            output_attentions=output_attentions,
+        )
+        factor_context = nn.functional.dropout(
+            factor_context,
+            p=self.dropout,
+            training=self.training,
+        )
+        hidden_states = self.factor_attn_layer_norm(residual + factor_context)
+        self.last_factor_attention = factor_attention
+        return (hidden_states,) + outputs[1:]
 
 
 class BartCaptionModel(nn.Module):
@@ -81,6 +159,20 @@ class BartCaptionModel(nn.Module):
             self.factor_dropout = nn.Dropout(
                 float(factor_config.get("dropout", 0.1))
             )
+            self.audio_modality_dropout = float(
+                factor_config.get("audio_modality_dropout", 0.0)
+            )
+            if not 0.0 <= self.audio_modality_dropout < 1.0:
+                raise ValueError("audio_modality_dropout must be in [0, 1).")
+            decoder_layers = self.decoder.model.decoder.layers
+            for index, layer in enumerate(decoder_layers):
+                dual_layer = DualCrossAttentionBartDecoderLayer(self.decoder.config)
+                dual_layer.load_state_dict(layer.state_dict(), strict=False)
+                dual_layer.factor_attn.load_state_dict(layer.encoder_attn.state_dict())
+                dual_layer.factor_attn_layer_norm.load_state_dict(
+                    layer.encoder_attn_layer_norm.state_dict()
+                )
+                decoder_layers[index] = dual_layer
             init_std = float(self.decoder.config.init_std)
             nn.init.normal_(
                 self.factor_value_projection.weight,
@@ -94,6 +186,15 @@ class BartCaptionModel(nn.Module):
                 std=init_std,
             )
         self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
+
+    def initialize_factor_attention_from_audio(self):
+        if not self.factor_enabled:
+            return
+        for layer in self.decoder.model.decoder.layers:
+            layer.factor_attn.load_state_dict(layer.encoder_attn.state_dict())
+            layer.factor_attn_layer_norm.load_state_dict(
+                layer.encoder_attn_layer_norm.state_dict()
+            )
 
     @property
     def device(self):
@@ -181,6 +282,14 @@ class BartCaptionModel(nn.Module):
             return_dict=True,
         )["last_hidden_state"]
         batch_size, audio_token_count, _ = audio_memory.shape
+        if self.factor_enabled and self.training and self.audio_modality_dropout > 0.0:
+            drop_audio = torch.rand(
+                batch_size,
+                1,
+                1,
+                device=audio_memory.device,
+            ) < self.audio_modality_dropout
+            audio_memory = audio_memory.masked_fill(drop_audio, 0.0)
         audio_mask = torch.ones(
             batch_size,
             audio_token_count,
@@ -196,6 +305,8 @@ class BartCaptionModel(nn.Module):
             memory = torch.cat([audio_memory, factor_tokens], dim=1)
             memory_mask = torch.cat([audio_mask, flat_factor_mask], dim=1)
             factor_time_length = factors.shape[-1]
+            for layer in self.decoder.model.decoder.layers:
+                layer.audio_token_count = audio_token_count
         else:
             memory = audio_memory
             memory_mask = audio_mask
@@ -325,11 +436,12 @@ class BartCaptionModel(nn.Module):
         )
         if outputs.cross_attentions is None:
             raise RuntimeError("BART did not return decoder cross-attention weights.")
-        cross_attention = outputs.cross_attentions[layer_index].mean(dim=1)
-        audio_token_count = metadata["audio_token_count"]
+        decoder_layer = self.decoder.model.decoder.layers[layer_index]
+        if decoder_layer.last_factor_attention is None:
+            raise RuntimeError("BART did not return factor cross-attention weights.")
+        factor_source_attention = decoder_layer.last_factor_attention.mean(dim=1)
         time_length = metadata["factor_time_length"]
         factor_count = len(self.factor_names)
-        factor_source_attention = cross_attention[:, :, audio_token_count:]
         expected_factor_tokens = time_length * factor_count
         if factor_source_attention.size(-1) != expected_factor_tokens:
             raise RuntimeError(
@@ -337,13 +449,12 @@ class BartCaptionModel(nn.Module):
                 f"{factor_source_attention.size(-1)} != {expected_factor_tokens}."
             )
         factor_attention = factor_source_attention.reshape(
-            cross_attention.size(0),
-            cross_attention.size(1),
+            factor_source_attention.size(0),
+            factor_source_attention.size(1),
             time_length,
             factor_count,
         )
         factor_attention_mass = factor_attention.sum(dim=2)
-        total_factor_attention = factor_attention_mass.sum(dim=-1)
         target_mask = torch.zeros_like(input_ids, dtype=torch.bool)
         for token_id in self.id_to_jamo:
             target_mask |= input_ids == token_id
@@ -352,7 +463,6 @@ class BartCaptionModel(nn.Module):
             "target_ids": input_ids,
             "target_mask": target_mask,
             "factor_attention_mass": factor_attention_mass,
-            "total_factor_attention": total_factor_attention,
             "layer_index": layer_index,
         }
 
