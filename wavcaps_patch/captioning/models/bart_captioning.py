@@ -455,6 +455,7 @@ class BartCaptionModel(nn.Module):
             factor_count,
         )
         factor_attention_mass = factor_attention.sum(dim=2)
+        factor_attention_by_time = factor_attention.permute(0, 1, 3, 2).contiguous()
         target_mask = torch.zeros_like(input_ids, dtype=torch.bool)
         for token_id in self.id_to_jamo:
             target_mask |= input_ids == token_id
@@ -463,6 +464,8 @@ class BartCaptionModel(nn.Module):
             "target_ids": input_ids,
             "target_mask": target_mask,
             "factor_attention_mass": factor_attention_mass,
+            "factor_attention_by_time": factor_attention_by_time,
+            "factor_time_mask": factor_mask.bool(),
             "layer_index": layer_index,
         }
 
