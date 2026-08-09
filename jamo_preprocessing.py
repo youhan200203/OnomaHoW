@@ -31,6 +31,30 @@ CHOSEONG_SET = frozenset(CHOSEONG)
 JUNGSEONG_SET = frozenset(JUNGSEONG)
 JONGSEONG_SET = frozenset(JONGSEONG)
 
+CHOSEONG_ROMANIZATION = dict(zip(
+    CHOSEONG,
+    (
+        "G", "KK", "N", "D", "TT", "R", "M", "B", "PP", "S",
+        "SS", "", "J", "JJ", "CH", "K", "T", "P", "H",
+    ),
+))
+JUNGSEONG_ROMANIZATION = dict(zip(
+    JUNGSEONG,
+    (
+        "A", "AE", "YA", "YAE", "EO", "E", "YEO", "YE", "O", "WA",
+        "WAE", "OE", "YO", "U", "WO", "WE", "WI", "YU", "EU", "UI",
+        "I",
+    ),
+))
+JONGSEONG_ROMANIZATION = dict(zip(
+    JONGSEONG,
+    (
+        "K", "K", "K", "N", "N", "N", "T", "L", "L", "LM",
+        "L", "L", "L", "L", "L", "M", "B", "B", "T", "T",
+        "NG", "T", "T", "K", "T", "P", "T",
+    ),
+))
+
 STANDALONE_REPLACEMENTS = {
     "ㅏ": "아",
     "ㅓ": "어",
@@ -107,6 +131,35 @@ def hangul_caption_to_jamo(caption: str) -> str:
     if unsupported:
         raise ValueError(f"Unsupported canonical Jamo: {unsupported!r}")
     return " ".join(jamo)
+
+
+def hangul_caption_to_romanized(caption: str) -> str:
+    """Convert spaced Hangul syllables to the OnomaCap Latin notation."""
+
+    tokens = caption.split()
+    if not tokens or not all(is_precomposed_hangul_syllable(token) for token in tokens):
+        raise ValueError(f"Caption must contain spaced Hangul syllables: {caption!r}")
+
+    romanized_tokens: list[str] = []
+    for token in tokens:
+        components = unicodedata.normalize("NFD", token)
+        onset, vowel = components[:2]
+        romanized = (
+            CHOSEONG_ROMANIZATION[onset]
+            + JUNGSEONG_ROMANIZATION[vowel]
+        )
+        if len(components) == 3:
+            romanized += JONGSEONG_ROMANIZATION[components[2]]
+        romanized_tokens.append(romanized)
+    return " ".join(romanized_tokens)
+
+
+def normalize_romanized_caption(caption: str) -> str:
+    """Normalize an OnomaCap Latin caption while preserving token boundaries."""
+
+    text = _replace_controls_with_spaces(str(caption)).upper()
+    text = PUNCTUATION_RE.sub(" ", text)
+    return WHITESPACE_RE.sub(" ", text).strip()
 
 
 def jamo_to_hangul_caption(jamo: str) -> str:

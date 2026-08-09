@@ -100,6 +100,8 @@ def validate(
     beam_size,
     disable_audio=False,
     condition="joint",
+    prediction_transform=None,
+    reference_captions_by_file=None,
 ):
     val_logger = logger.bind(indent=1)
     model.eval()
@@ -131,6 +133,15 @@ def validate(
             ]
         )
         file_names.extend(audio_names)
+
+    if prediction_transform is not None:
+        predicted_captions = [
+            prediction_transform(caption) for caption in predicted_captions
+        ]
+    if reference_captions_by_file is not None:
+        reference_captions = [
+            reference_captions_by_file[file_name] for file_name in file_names
+        ]
 
     captions_pred, captions_gt = decode_output(
         predicted_captions,

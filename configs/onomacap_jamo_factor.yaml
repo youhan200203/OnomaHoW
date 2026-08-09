@@ -63,7 +63,7 @@ training:
   checkpoint_root: "/content/drive/MyDrive/OnomaCap/checkpoints"
 
 evaluation:
-  beam_size: 1
+  beam_size: 3
 
 results:
   root: "/content/drive/MyDrive/OnomaCap/results"
