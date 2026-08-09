@@ -338,7 +338,15 @@ class BartCaptionModel(nn.Module):
         )
         return flat_tokens, flat_mask
 
-    def encode_memory(self, audios, factors=None, factor_mask=None):
+    def encode_memory(
+        self,
+        audios,
+        factors=None,
+        factor_mask=None,
+        disable_audio=False,
+    ):
+        if disable_audio and not self.factor_enabled:
+            raise ValueError("disable_audio requires factor conditioning.")
         audio_embeds = self.forward_encoder(audios)
         audio_memory = self.decoder.model.encoder(
             input_ids=None,
@@ -350,10 +358,10 @@ class BartCaptionModel(nn.Module):
             return_dict=True,
         )["last_hidden_state"]
         batch_size, audio_token_count, _ = audio_memory.shape
-        if self.factor_enabled and self.training:
-            if self.factor_only_training:
+        if self.factor_enabled:
+            if disable_audio or (self.training and self.factor_only_training):
                 audio_memory = torch.zeros_like(audio_memory)
-            elif self.effective_audio_modality_dropout > 0.0:
+            elif self.training and self.effective_audio_modality_dropout > 0.0:
                 drop_audio = torch.rand(
                     batch_size,
                     1,
@@ -625,6 +633,7 @@ class BartCaptionModel(nn.Module):
         min_length=4,
         top_p=0.9,
         repetition_penalty=1.0,
+        disable_audio=False,
     ):
         if max_length is None:
             max_length = self.max_text_length
@@ -634,6 +643,7 @@ class BartCaptionModel(nn.Module):
             samples,
             factors,
             factor_mask,
+            disable_audio=disable_audio,
         )
         decoder_input_ids = torch.full(
             (encoder_outputs["last_hidden_state"].size(0), 1),

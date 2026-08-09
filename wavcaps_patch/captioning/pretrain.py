@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import time
+from pathlib import Path
 
 import torch
 import wandb
@@ -90,9 +91,20 @@ def train(model, dataloader, optimizer, scheduler, device, epoch, clip_grad=0):
 
 
 @torch.no_grad()
-def validate(data_loader, model, device, log_dir, epoch, beam_size):
+def validate(
+    data_loader,
+    model,
+    device,
+    log_dir,
+    epoch,
+    beam_size,
+    disable_audio=False,
+    condition="joint",
+):
     val_logger = logger.bind(indent=1)
     model.eval()
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
     predicted_captions = []
     reference_captions = []
     file_names = []
@@ -107,6 +119,7 @@ def validate(data_loader, model, device, log_dir, epoch, beam_size):
                 samples=audios,
                 factors=factors,
                 factor_mask=factor_mask,
+                disable_audio=disable_audio,
                 num_beams=beam_size,
             )
 
@@ -132,7 +145,7 @@ def validate(data_loader, model, device, log_dir, epoch, beam_size):
 
     for metric, values in metrics.items():
         val_logger.info(
-            f"beam search (size {beam_size}): {metric:<7s}: "
+            f"{condition} beam search (size {beam_size}): {metric:<7s}: "
             f"{values['score']:7.4f}"
         )
     val_logger.info(f"Evaluation time: {eval_time:.1f}")

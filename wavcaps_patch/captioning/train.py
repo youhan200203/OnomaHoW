@@ -253,25 +253,49 @@ def main():
             f"lr: {optimizer.param_groups[0]['lr']:.6f}."
         )
 
-        main_logger.info("Validating OnomaCap metrics...")
-        metrics = validate(
+        main_logger.info("Validating factor-only OnomaCap metrics...")
+        factor_only_metrics = validate(
             val_loader,
             model,
             device=device,
-            log_dir=log_output_dir,
+            log_dir=Path(log_output_dir) / "factor_only",
             epoch=epoch,
             beam_size=evaluation_beam_size,
+            disable_audio=True,
+            condition="factor_only",
         )
-        selection_score = float(metrics["bleu_1"]["score"])
+        main_logger.info("Validating joint OnomaCap metrics...")
+        joint_metrics = validate(
+            val_loader,
+            model,
+            device=device,
+            log_dir=Path(log_output_dir) / "joint",
+            epoch=epoch,
+            beam_size=evaluation_beam_size,
+            disable_audio=False,
+            condition="joint",
+        )
+        selection_score = float(joint_metrics["bleu_1"]["score"])
         selection_scores.append(selection_score)
         wandb.log(
-            {f"val/{name}": float(values["score"]) for name, values in metrics.items()}
+            {
+                f"val/factor_only/{name}": float(values["score"])
+                for name, values in factor_only_metrics.items()
+            }
+            | {
+                f"val/joint/{name}": float(values["score"])
+                for name, values in joint_metrics.items()
+            }
             | {"epoch": epoch}
         )
 
-        val_scores = {
+        factor_only_val_scores = {
             name: float(values["score"])
-            for name, values in metrics.items()
+            for name, values in factor_only_metrics.items()
+        }
+        joint_val_scores = {
+            name: float(values["score"])
+            for name, values in joint_metrics.items()
         }
         if selection_score >= max(selection_scores):
             atomic_torch_save(
@@ -280,9 +304,11 @@ def main():
                     "optimizer": optimizer.state_dict(),
                     "beam_size": evaluation_beam_size,
                     "epoch": epoch,
-                    "selection_metric": "bleu_1",
+                    "selection_metric": "val/joint/bleu_1",
                     "selection_score": selection_score,
-                    "val_scores": val_scores,
+                    "factor_only_val_scores": factor_only_val_scores,
+                    "joint_val_scores": joint_val_scores,
+                    "val_scores": joint_val_scores,
                     "config": config,
                 },
                 best_model_path,
@@ -295,7 +321,9 @@ def main():
             "global_step": epoch * len(train_loader),
             "loss_stats": loss_stats,
             "selection_scores": selection_scores,
-            "val_scores": val_scores,
+            "factor_only_val_scores": factor_only_val_scores,
+            "joint_val_scores": joint_val_scores,
+            "val_scores": joint_val_scores,
             "config": config,
             "python_rng_state": random.getstate(),
             "numpy_rng_state": np.random.get_state(),
