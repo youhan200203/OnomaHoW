@@ -218,6 +218,22 @@ def main():
 
     for epoch in range(start_epoch, config["training"]["epochs"] + 1):
         main_logger.info(f"Training for epoch [{epoch}]")
+        phase = model.set_training_epoch(epoch)
+        main_logger.info(
+            f"Training phase: {phase['phase']}, "
+            f"audio modality dropout: {phase['audio_modality_dropout']:.3f}, "
+            f"trainable parameters: {phase['trainable_parameters']:,}"
+        )
+        wandb.log(
+            {
+                "epoch": epoch,
+                "train/factor_only": int(phase["factor_only"]),
+                "train/audio_modality_dropout": phase[
+                    "audio_modality_dropout"
+                ],
+                "train/trainable_parameters": phase["trainable_parameters"],
+            }
+        )
         if scheduler is None:
             scheduler_warmup.step()
         train_statistics = train(

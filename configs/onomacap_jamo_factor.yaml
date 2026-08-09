@@ -1,4 +1,4 @@
-exp_name: "onomacap_htsat_bart_jamo_factor_dual_cross_attn_bf16"
+exp_name: "onomacap_htsat_bart_jamo_factor_dual_cross_attn_curriculum_bf16"
 device: "cuda"
 pretrain: true
 pretrain_strict: false
@@ -40,6 +40,8 @@ factor_args:
   hop_ms: 100
   dropout: 0.1
   audio_modality_dropout: 0.2
+  factor_only_epochs: 3
+  audio_dropout_transition_epochs: 3
 
 optim_args:
   scheduler: "cosine"

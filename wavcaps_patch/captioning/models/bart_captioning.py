@@ -146,6 +146,8 @@ class BartCaptionModel(nn.Module):
         factor_config = config.get("factor_args", {})
         self.factor_enabled = bool(factor_config.get("enabled", False))
         self.factor_names = tuple(factor_config.get("names", ()))
+        self.factor_only_training = False
+        self.effective_audio_modality_dropout = 0.0
         if self.factor_enabled:
             if not self.factor_names:
                 raise ValueError("factor_args.names must not be empty.")
@@ -164,6 +166,17 @@ class BartCaptionModel(nn.Module):
             )
             if not 0.0 <= self.audio_modality_dropout < 1.0:
                 raise ValueError("audio_modality_dropout must be in [0, 1).")
+            self.factor_only_epochs = int(factor_config.get("factor_only_epochs", 0))
+            self.audio_dropout_transition_epochs = int(
+                factor_config.get("audio_dropout_transition_epochs", 0)
+            )
+            if self.factor_only_epochs < 0:
+                raise ValueError("factor_only_epochs must be non-negative.")
+            if self.audio_dropout_transition_epochs < 0:
+                raise ValueError(
+                    "audio_dropout_transition_epochs must be non-negative."
+                )
+            self.effective_audio_modality_dropout = self.audio_modality_dropout
             decoder_layers = self.decoder.model.decoder.layers
             for index, layer in enumerate(decoder_layers):
                 dual_layer = DualCrossAttentionBartDecoderLayer(self.decoder.config)
@@ -195,6 +208,61 @@ class BartCaptionModel(nn.Module):
             layer.factor_attn_layer_norm.load_state_dict(
                 layer.encoder_attn_layer_norm.state_dict()
             )
+
+    @staticmethod
+    def _is_factor_parameter(name):
+        return (
+            name.startswith("factor_")
+            or ".factor_attn." in name
+            or ".factor_attn_layer_norm." in name
+        )
+
+    def set_training_epoch(self, epoch):
+        if not self.factor_enabled:
+            return {
+                "phase": "joint",
+                "factor_only": False,
+                "audio_modality_dropout": 0.0,
+                "trainable_parameters": sum(
+                    parameter.numel() for parameter in self.parameters()
+                ),
+            }
+        if epoch < 1:
+            raise ValueError("Training epoch must be at least 1.")
+
+        self.factor_only_training = epoch <= self.factor_only_epochs
+        if self.factor_only_training:
+            phase = "factor_only"
+            effective_dropout = 1.0
+        else:
+            transition_step = epoch - self.factor_only_epochs
+            if transition_step <= self.audio_dropout_transition_epochs:
+                phase = "audio_dropout_transition"
+                progress = transition_step / self.audio_dropout_transition_epochs
+                effective_dropout = 1.0 - progress * (
+                    1.0 - self.audio_modality_dropout
+                )
+            else:
+                phase = "joint"
+                effective_dropout = self.audio_modality_dropout
+
+        self.effective_audio_modality_dropout = effective_dropout
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad = (
+                self._is_factor_parameter(name)
+                if self.factor_only_training
+                else True
+            )
+        return {
+            "phase": phase,
+            "factor_only": self.factor_only_training,
+            "audio_modality_dropout": effective_dropout,
+            "trainable_parameters": sum(
+                parameter.numel()
+                for parameter in self.parameters()
+                if parameter.requires_grad
+            ),
+        }
 
     @property
     def device(self):
@@ -282,14 +350,17 @@ class BartCaptionModel(nn.Module):
             return_dict=True,
         )["last_hidden_state"]
         batch_size, audio_token_count, _ = audio_memory.shape
-        if self.factor_enabled and self.training and self.audio_modality_dropout > 0.0:
-            drop_audio = torch.rand(
-                batch_size,
-                1,
-                1,
-                device=audio_memory.device,
-            ) < self.audio_modality_dropout
-            audio_memory = audio_memory.masked_fill(drop_audio, 0.0)
+        if self.factor_enabled and self.training:
+            if self.factor_only_training:
+                audio_memory = torch.zeros_like(audio_memory)
+            elif self.effective_audio_modality_dropout > 0.0:
+                drop_audio = torch.rand(
+                    batch_size,
+                    1,
+                    1,
+                    device=audio_memory.device,
+                ) < self.effective_audio_modality_dropout
+                audio_memory = audio_memory.masked_fill(drop_audio, 0.0)
         audio_mask = torch.ones(
             batch_size,
             audio_token_count,
