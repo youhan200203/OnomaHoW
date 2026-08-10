@@ -1,4 +1,4 @@
-exp_name: "onomacap_htsat_bart_jamo_bf16"
+exp_name: "onomacap_htsat_bart_jamo_bf16_sharedsplit_vocabmask_v1"
 device: "cuda"
 pretrain: false
 seed: 20

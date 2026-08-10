@@ -1,8 +1,8 @@
-exp_name: "onomacap_htsat_bart_jamo_factor_dual_cross_attn_curriculum_bf16"
+exp_name: "onomacap_htsat_bart_jamo_factor_dual_cross_attn_curriculum_bf16_sharedsplit_vocabmask_v1"
 device: "cuda"
 pretrain: true
 pretrain_strict: false
-pretrain_path: "/content/drive/MyDrive/OnomaCap/checkpoints/onomacap_htsat_bart_jamo_bf16_lr_3e-05_batch_16_seed_20/best_model.pt"
+pretrain_path: "/content/drive/MyDrive/OnomaCap/checkpoints/onomacap_htsat_bart_jamo_bf16_sharedsplit_vocabmask_v1_lr_3e-05_batch_16_seed_20/best_model.pt"
 seed: 20
 
 audio_args:

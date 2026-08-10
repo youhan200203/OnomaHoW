@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import os
 import re
 import unicodedata
 from collections import Counter
@@ -21,6 +23,8 @@ JAMO_COLUMNS = tuple(f"candidate{i}_jamo" for i in range(1, 6))
 DUPLICATE_MARKER = "JUNG BOK DOEN SAEM PEUL"
 EXPECTED_LATIN_AUDIO = "21_ (12).mp3"
 EXPECTED_OUTPUT_ROWS = 7_961
+SPLIT_MANIFEST_VERSION = 1
+SPLIT_NAMES = ("train", "val", "test")
 
 CHOSEONG = tuple(chr(codepoint) for codepoint in range(0x1100, 0x1113))
 JUNGSEONG = tuple(chr(codepoint) for codepoint in range(0x1161, 0x1176))
@@ -160,6 +164,162 @@ def normalize_romanized_caption(caption: str) -> str:
     text = _replace_controls_with_spaces(str(caption)).upper()
     text = PUNCTUATION_RE.sub(" ", text)
     return WHITESPACE_RE.sub(" ", text).strip()
+
+
+def _dataset_fingerprint(frame) -> str:
+    records = sorted(
+        (str(audio_file), str(class_name))
+        for audio_file, class_name in zip(frame["audio_file"], frame["class"])
+    )
+    digest = hashlib.sha256()
+    for audio_file, class_name in records:
+        digest.update(audio_file.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(class_name.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def load_or_create_split_manifest(frame, manifest_path: Path, split_seed: int):
+    """Load an immutable Drive split manifest, or create it exactly once."""
+
+    import pandas as pd
+
+    manifest_path = Path(manifest_path)
+    metadata_path = manifest_path.with_suffix(manifest_path.suffix + ".meta.json")
+    required_columns = {"audio_file", "class"}
+    missing_columns = required_columns - set(frame.columns)
+    if missing_columns:
+        raise ValueError(f"Missing split columns: {sorted(missing_columns)}")
+    if frame["audio_file"].isna().any() or frame["class"].isna().any():
+        raise ValueError("Split source contains missing audio_file or class values.")
+    if frame["audio_file"].astype(str).duplicated().any():
+        raise ValueError("Split source contains duplicate audio_file values.")
+
+    source = frame.copy()
+    source["audio_file"] = source["audio_file"].astype(str)
+    source["class"] = source["class"].astype(str)
+    source_fingerprint = _dataset_fingerprint(source)
+    manifest_exists = manifest_path.is_file()
+    metadata_exists = metadata_path.is_file()
+
+    if manifest_exists != metadata_exists:
+        raise RuntimeError(
+            "Split manifest is incomplete: both the CSV and metadata JSON "
+            "must exist, or neither may exist."
+        )
+
+    if not manifest_exists:
+        from sklearn.model_selection import train_test_split
+
+        train_frame, rest_frame = train_test_split(
+            source,
+            test_size=0.2,
+            stratify=source["class"],
+            random_state=split_seed,
+        )
+        val_frame, test_frame = train_test_split(
+            rest_frame,
+            test_size=0.5,
+            stratify=rest_frame["class"],
+            random_state=split_seed,
+        )
+        generated_splits = {
+            "train": train_frame,
+            "val": val_frame,
+            "test": test_frame,
+        }
+        manifest = pd.concat(
+            [
+                split_frame.assign(split=split_name)[
+                    ["audio_file", "class", "split"]
+                ]
+                for split_name, split_frame in generated_splits.items()
+            ],
+            ignore_index=True,
+        ).sort_values("audio_file", kind="stable")
+        split_counts = {
+            name: int((manifest["split"] == name).sum())
+            for name in SPLIT_NAMES
+        }
+        metadata = {
+            "version": SPLIT_MANIFEST_VERSION,
+            "split_seed": int(split_seed),
+            "row_count": int(len(source)),
+            "dataset_fingerprint": source_fingerprint,
+            "split_counts": split_counts,
+        }
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_manifest = manifest_path.with_suffix(
+            manifest_path.suffix + ".tmp"
+        )
+        temporary_metadata = metadata_path.with_suffix(
+            metadata_path.suffix + ".tmp"
+        )
+        manifest.to_csv(temporary_manifest, index=False)
+        temporary_metadata.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary_manifest, manifest_path)
+        os.replace(temporary_metadata, metadata_path)
+        print(f"Created split manifest: {manifest_path}")
+    else:
+        manifest = pd.read_csv(
+            manifest_path,
+            dtype={"audio_file": str, "class": str, "split": str},
+        )
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        print(f"Loaded existing split manifest: {manifest_path}")
+
+    if not {"audio_file", "class", "split"} <= set(manifest.columns):
+        raise ValueError("Split manifest is missing required columns.")
+    if manifest["audio_file"].isna().any() or manifest["class"].isna().any():
+        raise ValueError("Split manifest contains missing values.")
+    if manifest["audio_file"].duplicated().any():
+        raise ValueError("Split manifest contains duplicate audio_file values.")
+    if set(manifest["split"]) != set(SPLIT_NAMES):
+        raise ValueError(f"Invalid split names: {sorted(set(manifest['split']))}")
+    if int(metadata.get("version", -1)) != SPLIT_MANIFEST_VERSION:
+        raise ValueError("Split manifest version does not match.")
+    if int(metadata.get("split_seed", -1)) != int(split_seed):
+        raise ValueError("Split seed does not match the persisted manifest.")
+    if int(metadata.get("row_count", -1)) != len(source):
+        raise ValueError("Split manifest row count does not match the dataset.")
+    if metadata.get("dataset_fingerprint") != source_fingerprint:
+        raise ValueError("Split manifest dataset fingerprint does not match.")
+    if _dataset_fingerprint(manifest) != source_fingerprint:
+        raise ValueError("Split manifest rows do not match the current dataset.")
+
+    source_classes = dict(zip(source["audio_file"], source["class"]))
+    mismatched_classes = [
+        audio_file
+        for audio_file, class_name in zip(manifest["audio_file"], manifest["class"])
+        if source_classes.get(audio_file) != class_name
+    ]
+    if mismatched_classes:
+        raise ValueError(
+            f"Split manifest class mismatch: {mismatched_classes[:5]}"
+        )
+
+    source_by_name = source.set_index("audio_file", drop=False)
+    splits = {
+        split_name: source_by_name.loc[
+            manifest.loc[manifest["split"] == split_name, "audio_file"]
+        ].reset_index(drop=True)
+        for split_name in SPLIT_NAMES
+    }
+    actual_counts = {name: len(split) for name, split in splits.items()}
+    expected_counts = {
+        name: int(count)
+        for name, count in metadata.get("split_counts", {}).items()
+    }
+    if actual_counts != expected_counts:
+        raise ValueError(
+            f"Split counts do not match metadata: {actual_counts} != "
+            f"{expected_counts}"
+        )
+    return splits
 
 
 def jamo_to_hangul_caption(jamo: str) -> str:
