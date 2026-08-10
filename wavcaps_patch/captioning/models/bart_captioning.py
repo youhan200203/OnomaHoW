@@ -23,6 +23,34 @@ from tools.jamo_preprocessing import (
 )
 
 
+class CompactJamoTokenizer:
+    """Fixed 4-special-token + 67-canonical-Jamo vocabulary."""
+
+    SPECIAL_TOKENS = ("<s>", "<pad>", "</s>", "<unk>")
+
+    def __init__(self):
+        tokens = self.SPECIAL_TOKENS + tuple(JAMO_VOCAB)
+        self.token_to_id = {token: index for index, token in enumerate(tokens)}
+        self.id_to_token = {index: token for token, index in self.token_to_id.items()}
+        self.bos_token_id = self.token_to_id["<s>"]
+        self.pad_token_id = self.token_to_id["<pad>"]
+        self.eos_token_id = self.token_to_id["</s>"]
+        self.unk_token_id = self.token_to_id["<unk>"]
+
+    def __len__(self):
+        return len(self.token_to_id)
+
+    def convert_tokens_to_ids(self, tokens):
+        if isinstance(tokens, str):
+            return self.token_to_id.get(tokens, self.unk_token_id)
+        return [self.convert_tokens_to_ids(token) for token in tokens]
+
+    def convert_ids_to_tokens(self, token_ids):
+        if isinstance(token_ids, int):
+            return self.id_to_token.get(token_ids, "<unk>")
+        return [self.convert_ids_to_tokens(token_id) for token_id in token_ids]
+
+
 class DualCrossAttentionBartDecoderLayer(BartDecoderLayer):
     def __init__(self, config):
         super().__init__(config)
@@ -112,19 +140,40 @@ class BartCaptionModel(nn.Module):
 
         decoder_name = config["text_decoder_args"]["name"]
         decoder_pretrained = config["text_decoder_args"]["pretrained"]
-        self.tokenizer = BartTokenizer.from_pretrained(decoder_name)
-        if decoder_pretrained:
-            self.decoder = BartForConditionalGeneration.from_pretrained(decoder_name)
-        else:
+        compact_jamo_vocab = bool(
+            config["text_decoder_args"].get("compact_jamo_vocab", False)
+        )
+        if compact_jamo_vocab:
+            if decoder_pretrained:
+                raise ValueError(
+                    "compact_jamo_vocab requires text_decoder_args.pretrained=false."
+                )
+            self.tokenizer = CompactJamoTokenizer()
             bart_config = BartConfig.from_pretrained(decoder_name)
+            bart_config.vocab_size = len(self.tokenizer)
+            bart_config.bos_token_id = self.tokenizer.bos_token_id
+            bart_config.pad_token_id = self.tokenizer.pad_token_id
+            bart_config.eos_token_id = self.tokenizer.eos_token_id
+            bart_config.decoder_start_token_id = self.tokenizer.eos_token_id
+            bart_config.forced_bos_token_id = self.tokenizer.bos_token_id
+            bart_config.forced_eos_token_id = self.tokenizer.eos_token_id
             self.decoder = BartForConditionalGeneration(bart_config)
-
-        added_count = self.tokenizer.add_tokens(list(JAMO_VOCAB))
-        if added_count != len(JAMO_VOCAB):
-            raise RuntimeError(
-                f"Expected to add {len(JAMO_VOCAB)} Jamo tokens, added {added_count}."
-            )
-        self.decoder.resize_token_embeddings(len(self.tokenizer))
+        else:
+            self.tokenizer = BartTokenizer.from_pretrained(decoder_name)
+            if decoder_pretrained:
+                self.decoder = BartForConditionalGeneration.from_pretrained(
+                    decoder_name
+                )
+            else:
+                bart_config = BartConfig.from_pretrained(decoder_name)
+                self.decoder = BartForConditionalGeneration(bart_config)
+            added_count = self.tokenizer.add_tokens(list(JAMO_VOCAB))
+            if added_count != len(JAMO_VOCAB):
+                raise RuntimeError(
+                    f"Expected to add {len(JAMO_VOCAB)} Jamo tokens, "
+                    f"added {added_count}."
+                )
+            self.decoder.resize_token_embeddings(len(self.tokenizer))
 
         self.jamo_to_id = {
             token: self.tokenizer.convert_tokens_to_ids(token)
@@ -132,6 +181,21 @@ class BartCaptionModel(nn.Module):
         }
         if len(set(self.jamo_to_id.values())) != len(JAMO_VOCAB):
             raise RuntimeError("Canonical Jamo tokens do not have unique token IDs.")
+        if compact_jamo_vocab:
+            expected_vocab_size = len(CompactJamoTokenizer.SPECIAL_TOKENS) + len(
+                JAMO_VOCAB
+            )
+            if self.decoder.config.vocab_size != expected_vocab_size:
+                raise RuntimeError(
+                    "Compact decoder vocabulary size mismatch: "
+                    f"{self.decoder.config.vocab_size} != {expected_vocab_size}."
+                )
+            expected_jamo_ids = list(range(
+                len(CompactJamoTokenizer.SPECIAL_TOKENS),
+                expected_vocab_size,
+            ))
+            if sorted(self.jamo_to_id.values()) != expected_jamo_ids:
+                raise RuntimeError("Compact Jamo token IDs are not contiguous.")
         self.id_to_jamo = {token_id: token for token, token_id in self.jamo_to_id.items()}
         self.choseong_ids = frozenset(self.jamo_to_id[token] for token in CHOSEONG)
         self.jungseong_ids = frozenset(self.jamo_to_id[token] for token in JUNGSEONG)

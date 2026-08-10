@@ -1,4 +1,4 @@
-exp_name: "onomacap_htsat_bart_jamo_bf16_sharedsplit_vocabmask_v1"
+exp_name: "onomacap_htsat_bart_jamo_bf16_sharedsplit_compactvocab71_v1"
 device: "cuda"
 pretrain: false
 seed: 20
@@ -28,6 +28,7 @@ audio_encoder_args:
 text_decoder_args:
   name: "facebook/bart-base"
   pretrained: false
+  compact_jamo_vocab: true
   max_length: 80
 
 optim_args:
