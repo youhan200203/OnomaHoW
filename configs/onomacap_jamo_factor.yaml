@@ -1,4 +1,4 @@
-exp_name: "onomacap_htsat_bart_jamo_factor_dual_cross_attn_curriculum_bf16_sharedsplit_compactvocab71_v1"
+exp_name: "onomacap_jamo_factor_v1"
 device: "cuda"
 pretrain: false
 seed: 20

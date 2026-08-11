@@ -52,12 +52,7 @@ def main():
     config["optim_args"]["lr"] = args.lr
     setup_seed(config["seed"])
 
-    folder_name = "{}_lr_{}_batch_{}_seed_{}".format(
-        config["exp_name"],
-        config["optim_args"]["lr"],
-        config["data_args"]["batch_size"],
-        config["seed"],
-    )
+    folder_name = f"{config['exp_name']}_seed_{config['seed']}"
     _model_output_dir, log_output_dir = set_logger(folder_name)
     main_logger = logger.bind(indent=1)
 
@@ -66,6 +61,8 @@ def main():
         if torch.cuda.is_available()
         else ("cpu", platform.processor())
     )
+    if config["training"].get("precision") != "bf16":
+        raise ValueError('OnomaCap training requires training.precision: "bf16".')
     if device != "cuda" or not torch.cuda.is_bf16_supported():
         raise RuntimeError("OnomaCap Jamo BF16 training requires a BF16 CUDA GPU.")
     main_logger.info(f"Process on {device_name}")
