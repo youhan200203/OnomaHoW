@@ -28,7 +28,7 @@ audio_encoder_args:
 text_decoder_args:
   name: "facebook/bart-base"
   pretrained: false
-  compact_jamo_vocab: true
+  compact_jamo_vocab: false
   max_length: 80
 
 optim_args:

@@ -216,21 +216,37 @@ def main():
     for epoch in range(start_epoch, config["training"]["epochs"] + 1):
         main_logger.info(f"Training for epoch [{epoch}]")
         phase = model.set_training_epoch(epoch)
-        main_logger.info(
-            f"Training phase: {phase['phase']}, "
-            f"audio modality dropout: {phase['audio_modality_dropout']:.3f}, "
-            f"trainable parameters: {phase['trainable_parameters']:,}"
-        )
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train/factor_only": int(phase["factor_only"]),
-                "train/audio_modality_dropout": phase[
-                    "audio_modality_dropout"
-                ],
-                "train/trainable_parameters": phase["trainable_parameters"],
-            }
-        )
+        if model.factor_enabled:
+            main_logger.info(
+                f"Training phase: {phase['phase']}, "
+                f"audio modality dropout: "
+                f"{phase['audio_modality_dropout']:.3f}, "
+                f"trainable parameters: {phase['trainable_parameters']:,}"
+            )
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train/factor_only": int(phase["factor_only"]),
+                    "train/audio_modality_dropout": phase[
+                        "audio_modality_dropout"
+                    ],
+                    "train/trainable_parameters": phase[
+                        "trainable_parameters"
+                    ],
+                }
+            )
+        else:
+            main_logger.info(
+                f"Trainable parameters: {phase['trainable_parameters']:,}"
+            )
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train/trainable_parameters": phase[
+                        "trainable_parameters"
+                    ],
+                }
+            )
         if scheduler is None:
             scheduler_warmup.step()
         train_statistics = train(
@@ -250,50 +266,80 @@ def main():
             f"lr: {optimizer.param_groups[0]['lr']:.6f}."
         )
 
-        main_logger.info("Validating factor-only OnomaCap metrics...")
-        factor_only_metrics = validate(
-            val_loader,
-            model,
-            device=device,
-            log_dir=Path(log_output_dir) / "factor_only",
-            epoch=epoch,
-            beam_size=evaluation_beam_size,
-            disable_audio=True,
-            condition="factor_only",
-        )
-        main_logger.info("Validating joint OnomaCap metrics...")
-        joint_metrics = validate(
-            val_loader,
-            model,
-            device=device,
-            log_dir=Path(log_output_dir) / "joint",
-            epoch=epoch,
-            beam_size=evaluation_beam_size,
-            disable_audio=False,
-            condition="joint",
-        )
-        selection_score = float(joint_metrics["bleu_1"]["score"])
-        selection_scores.append(selection_score)
-        wandb.log(
-            {
-                f"val/factor_only/{name}": float(values["score"])
+        if model.factor_enabled:
+            main_logger.info("Validating factor-only OnomaCap metrics...")
+            factor_only_metrics = validate(
+                val_loader,
+                model,
+                device=device,
+                log_dir=Path(log_output_dir) / "factor_only",
+                epoch=epoch,
+                beam_size=evaluation_beam_size,
+                disable_audio=True,
+                condition="factor_only",
+            )
+            main_logger.info("Validating joint OnomaCap metrics...")
+            validation_metrics = validate(
+                val_loader,
+                model,
+                device=device,
+                log_dir=Path(log_output_dir) / "joint",
+                epoch=epoch,
+                beam_size=evaluation_beam_size,
+                disable_audio=False,
+                condition="joint",
+            )
+            factor_only_val_scores = {
+                name: float(values["score"])
                 for name, values in factor_only_metrics.items()
             }
-            | {
-                f"val/joint/{name}": float(values["score"])
-                for name, values in joint_metrics.items()
+            validation_scores = {
+                name: float(values["score"])
+                for name, values in validation_metrics.items()
             }
-            | {"epoch": epoch}
-        )
+            validation_state = {
+                "factor_only_val_scores": factor_only_val_scores,
+                "joint_val_scores": validation_scores,
+            }
+            wandb.log(
+                {
+                    f"val/factor_only/{name}": score
+                    for name, score in factor_only_val_scores.items()
+                }
+                | {
+                    f"val/joint/{name}": score
+                    for name, score in validation_scores.items()
+                }
+                | {"epoch": epoch}
+            )
+            selection_metric = "val/joint/bleu_1"
+        else:
+            main_logger.info("Validating audio-only OnomaCap metrics...")
+            validation_metrics = validate(
+                val_loader,
+                model,
+                device=device,
+                log_dir=log_output_dir,
+                epoch=epoch,
+                beam_size=evaluation_beam_size,
+                condition="audio_only",
+            )
+            validation_scores = {
+                name: float(values["score"])
+                for name, values in validation_metrics.items()
+            }
+            validation_state = {}
+            wandb.log(
+                {
+                    f"val/{name}": score
+                    for name, score in validation_scores.items()
+                }
+                | {"epoch": epoch}
+            )
+            selection_metric = "val/bleu_1"
 
-        factor_only_val_scores = {
-            name: float(values["score"])
-            for name, values in factor_only_metrics.items()
-        }
-        joint_val_scores = {
-            name: float(values["score"])
-            for name, values in joint_metrics.items()
-        }
+        selection_score = validation_scores["bleu_1"]
+        selection_scores.append(selection_score)
         if selection_score >= max(selection_scores):
             atomic_torch_save(
                 {
@@ -301,11 +347,10 @@ def main():
                     "optimizer": optimizer.state_dict(),
                     "beam_size": evaluation_beam_size,
                     "epoch": epoch,
-                    "selection_metric": "val/joint/bleu_1",
+                    "selection_metric": selection_metric,
                     "selection_score": selection_score,
-                    "factor_only_val_scores": factor_only_val_scores,
-                    "joint_val_scores": joint_val_scores,
-                    "val_scores": joint_val_scores,
+                    **validation_state,
+                    "val_scores": validation_scores,
                     "config": config,
                 },
                 best_model_path,
@@ -318,9 +363,8 @@ def main():
             "global_step": epoch * len(train_loader),
             "loss_stats": loss_stats,
             "selection_scores": selection_scores,
-            "factor_only_val_scores": factor_only_val_scores,
-            "joint_val_scores": joint_val_scores,
-            "val_scores": joint_val_scores,
+            **validation_state,
+            "val_scores": validation_scores,
             "config": config,
             "python_rng_state": random.getstate(),
             "numpy_rng_state": np.random.get_state(),
