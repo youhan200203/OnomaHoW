@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import csv
+import re
 from pathlib import Path
 
 from pycocoevalcap.bleu.bleu import Bleu
@@ -8,8 +9,15 @@ from pycocoevalcap.meteor.meteor import Meteor
 from pycocoevalcap.rouge.rouge import Rouge
 
 
+JVM_DIAGNOSTIC_RE = re.compile(
+    r"^\[\d+(?:\.\d+)?s\]"
+    r"\[(?:trace|debug|info|warning|error)\]"
+    r"\[[^\]]+\]"
+)
+
+
 class RobustMeteor(Meteor):
-    """METEOR 1.5 wrapper tolerant of delayed statistics lines."""
+    """METEOR 1.5 wrapper that separates JVM logs from its protocol."""
 
     def _write_line(self, line):
         payload = f"{line}\n"
@@ -41,6 +49,8 @@ class RobustMeteor(Meteor):
                 line = raw_line.strip()
             if not line:
                 continue
+            if JVM_DIAGNOSTIC_RE.match(line):
+                continue
 
             try:
                 values = [float(value) for value in line.split()]
@@ -53,10 +63,6 @@ class RobustMeteor(Meteor):
                 return line
             if expected == "score" and len(values) == 1:
                 return values[0]
-            if expected == "score" and len(values) > 1:
-                # Some Java/runtime combinations leave a delayed SCORE
-                # sufficient-statistics row in stdout before EVAL scores.
-                continue
             raise RuntimeError(
                 f"Unexpected METEOR {expected} response: {line!r}"
             )
