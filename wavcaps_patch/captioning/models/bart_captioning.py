@@ -288,7 +288,9 @@ class BartCaptionModel(nn.Module):
                 "factor_only": False,
                 "audio_modality_dropout": 0.0,
                 "trainable_parameters": sum(
-                    parameter.numel() for parameter in self.parameters()
+                    parameter.numel()
+                    for parameter in self.parameters()
+                    if parameter.requires_grad
                 ),
             }
         if epoch < 1:

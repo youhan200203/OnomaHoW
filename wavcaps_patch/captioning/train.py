@@ -121,6 +121,27 @@ def main():
             )
         main_logger.info(f"Loaded weights from {config['pretrain_path']}")
 
+    text_pretrain_path = config.get("text_pretrain_path")
+    if text_pretrain_path:
+        text_checkpoint = load_checkpoint(text_pretrain_path, "cpu")
+        expected_jamo_to_id = {
+            str(token): int(token_id)
+            for token, token_id in text_checkpoint["jamo_to_id"].items()
+        }
+        if expected_jamo_to_id != model.jamo_to_id:
+            raise RuntimeError(
+                "J-text tokenizer mismatch: "
+                f"checkpoint={expected_jamo_to_id}, model={model.jamo_to_id}"
+            )
+        if int(text_checkpoint["tokenizer_length"]) != len(model.tokenizer):
+            raise RuntimeError(
+                "J-text vocabulary size mismatch: "
+                f"{text_checkpoint['tokenizer_length']} != {len(model.tokenizer)}"
+            )
+        model.decoder.load_state_dict(text_checkpoint["decoder"], strict=True)
+        main_logger.info(f"Loaded J-text decoder from {text_pretrain_path}")
+        del text_checkpoint
+
     optimizer = get_optimizer(
         model.parameters(),
         lr=config["optim_args"]["lr"],
