@@ -620,11 +620,10 @@ class BartCaptionModel(nn.Module):
         eos_id = self.tokenizer.eos_token_id
         pad_id = self.tokenizer.pad_token_id
 
-        prefix = [
-            token_id
-            for token_id in input_ids.tolist()
-            if token_id not in {decoder_start_id, pad_id}
-        ]
+        prefix = input_ids.tolist()
+        if prefix and prefix[0] == decoder_start_id:
+            prefix = prefix[1:]
+        prefix = [token_id for token_id in prefix if token_id != pad_id]
         if not prefix:
             return [bos_id]
         if prefix[0] != bos_id:
@@ -636,8 +635,8 @@ class BartCaptionModel(nn.Module):
         if payload[-1] == eos_id:
             return [eos_id]
 
+        remaining = self._active_generation_max_length - len(prefix)
         state = "choseong"
-        completed_syllable = False
         for token_id in payload:
             if state == "choseong":
                 if token_id not in self.choseong_ids:
@@ -647,7 +646,6 @@ class BartCaptionModel(nn.Module):
                 if token_id not in self.jungseong_ids:
                     raise ValueError(f"Expected jungseong token ID, got {token_id}.")
                 state = "optional_jongseong"
-                completed_syllable = True
             elif token_id in self.jongseong_ids:
                 state = "choseong"
             elif token_id in self.choseong_ids:
@@ -656,18 +654,20 @@ class BartCaptionModel(nn.Module):
                 raise ValueError(f"Invalid Jamo token ID in prefix: {token_id}.")
 
         if state == "jungseong":
+            if remaining < 2:
+                raise ValueError(
+                    "Insufficient generation length for jungseong and EOS."
+                )
             return sorted(self.jungseong_ids)
         if state == "optional_jongseong":
-            remaining = self._active_generation_max_length - len(input_ids)
             if remaining <= 1:
                 return [eos_id]
             if remaining == 2:
                 return sorted(self.jongseong_ids | {eos_id})
             return sorted(self.choseong_ids | self.jongseong_ids | {eos_id})
-        allowed = set(self.choseong_ids)
-        if completed_syllable:
-            allowed.add(eos_id)
-        return sorted(allowed)
+        if remaining <= 2:
+            return [eos_id]
+        return sorted(self.choseong_ids | {eos_id})
 
     def _decode_generated_ids(self, outputs):
         ignored_ids = {
@@ -725,7 +725,9 @@ class BartCaptionModel(nn.Module):
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
             encoder_outputs=encoder_outputs,
-            max_length=max_length,
+            # HF generation length includes the leading decoder-start token,
+            # while max_text_length counts [BOS] + Jamo + [EOS].
+            max_length=max_length + 1,
             min_length=min_length,
             repetition_penalty=repetition_penalty,
             prefix_allowed_tokens_fn=self._allowed_next_tokens,
